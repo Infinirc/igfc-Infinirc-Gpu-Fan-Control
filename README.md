@@ -1,4 +1,4 @@
-# Infinirc GPU Fan Control (IGFC)
+# Infinirc GPU Fan Control (igfc tool)
 
 Infinirc GPU Fan Control (IGFC) 是一個用於 NVIDIA GPU 的風扇控制工具。它允許用戶自定義風扇曲線，設置固定風扇速度，或使用自動模式。
 
