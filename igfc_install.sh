@@ -1,12 +1,10 @@
 #!/bin/bash
 
-
 if [ "$EUID" -ne 0 ]; then
   echo "請使用 root 權限運行此腳本"
   echo "Please run this script with root privileges"
   exit
 fi
-
 
 echo " ######              ####     ##                ##                                  ##                ####"
 echo "   ##               ##                                                                               ##"
@@ -18,7 +16,7 @@ echo " ######   ##   ##   ##      ######   ##   ##  ######   ##        #####    
 echo "                                                                                            #####"
 echo
 
-# 檢測操作系統
+
 if [ -f /etc/os-release ]; then
     . /etc/os-release
     OS=$NAME
@@ -30,7 +28,6 @@ elif [ -f /etc/lsb-release ]; then
 else
     OS=$(uname -s)
 fi
-
 
 echo "檢測到的操作系統：$OS"
 echo "Detected operating system: $OS"
@@ -56,13 +53,15 @@ echo "啟用 NVIDIA 持續模式..."
 echo "Enabling NVIDIA persistent mode..."
 nvidia-smi -pm 1
 
-
 echo "Creating C program..."
 cat > /usr/local/src/infinirc_gpu_fan_control.c << EOL
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <syslog.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <jansson.h>
@@ -70,8 +69,9 @@ cat > /usr/local/src/infinirc_gpu_fan_control.c << EOL
 
 #define CONFIG_FILE "/etc/infinirc_gpu_fan_control.conf"
 #define CURVE_FILE "/etc/infinirc_gpu_fan_curve.json"
+
 #define MAX_GPU_COUNT 8
-#define MAX_FAN_COUNT 3
+#define MAX_FAN_COUNT 4
 #define MAX_CURVE_POINTS 20
 
 typedef struct {
@@ -87,7 +87,6 @@ typedef struct {
 unsigned int device_count = 0;
 volatile sig_atomic_t keep_running = 1;
 
-
 void reset_fan_curve(void);
 char* get_gpu_model(void);
 void display_gpu_info(void);
@@ -97,16 +96,21 @@ FanCurve* read_fan_curve(void);
 void write_fan_curve(FanCurve *curve);
 void edit_fan_curve(int temp, int speed);
 void show_fan_curve(void);
-int get_gpu_fan_count(int gpu_index);
+int get_gpu_fan_count(void);
 void set_fan_speed(int gpu_index, int fan_index, int speed);
+void set_gpu_fan_speed(int gpu_index, int speed);
 int get_gpu_temp(nvmlDevice_t handle);
 int adjust_fan_speed(int temp);
+int adjust_fan_speed_with_curve(int temp, FanCurve *curve);
 void show_help(void);
 void list_gpus(void);
 void enable_persistence_mode(void);
 void write_config_for_gpu(const char* gpu_key, const char* mode, int speed);
 void maintain_fan_settings(void);
 void signal_handler(int signum);
+int get_gpu_fan_count(void);
+
+
 
 void reset_fan_curve(void) {
     FanCurve default_curve = {
@@ -283,80 +287,70 @@ void show_fan_curve(void) {
     }
 }
 
-int get_gpu_fan_count(int gpu_index) {
-    char command[256];
-    FILE *fp;
-    char buffer[1024];
-    int fan_count = 0;
-
-    snprintf(command, sizeof(command), "nvidia-settings -q [gpu:%d]/GPUFanControlState -q [gpu:%d]/GPUTargetFanSpeed | grep -c 'Fan'", gpu_index, gpu_index);
-    fp = popen(command, "r");
+int get_gpu_fan_count(void) {
+    char command[] = "nvidia-settings -c :0 -q fans | grep -c 'Fan'";
+    FILE *fp = popen(command, "r");
     if (fp == NULL) {
         printf("無法執行命令以獲取風扇數量\n");
         printf("Unable to execute command to get fan count\n");
-        return 1;
+        return 0;
     }
 
-    if (fgets(buffer, sizeof(buffer), fp) != NULL) {
-        fan_count = atoi(buffer);
-    }
+    int fan_count = 0;
+    fscanf(fp, "%d", &fan_count);
     pclose(fp);
 
-    return fan_count > 0 ? fan_count : 1;
+    return fan_count;
 }
-
 #include <unistd.h>
 #include <fcntl.h>
 
 void set_fan_speed(int gpu_index, int fan_index, int speed) {
     char command[512];
-    FILE *fp;
-    char buffer[1024];
-    int original_stderr;
+    snprintf(command, sizeof(command),
+             "sudo nvidia-settings -c :0 "
+             "-a \"[gpu:%d]/GPUFanControlState=1\" "
+             "-a \"[fan:%d]/GPUTargetFanSpeed=%d\"",
+             gpu_index, fan_index, speed);
 
+    int result = system(command);
 
-    original_stderr = dup(STDERR_FILENO);
-
-
-    int dev_null = open("/dev/null", O_WRONLY);
-    dup2(dev_null, STDERR_FILENO);
-    close(dev_null);
-
-
-    snprintf(command, sizeof(command), 
-             "nvidia-settings -c :0 "
-             "-a [gpu:%d]/GPUFanControlState=1 "
-             "-a [fan:%d]/GPUTargetFanSpeed=%d", 
-             gpu_index, gpu_index * 2 + fan_index, speed);
-    
-    system(command);
-
-
-    dup2(original_stderr, STDERR_FILENO);
-    close(original_stderr);
-
-    printf("已設置 GPU %d 的風扇 %d 速度為 %d%%\n", gpu_index, fan_index, speed);
-    printf("Set GPU %d fan %d speed to %d%%\n", gpu_index, fan_index, speed);
-
-
-    snprintf(command, sizeof(command), 
-             "nvidia-settings -c :0 -q [fan:%d]/GPUCurrentFanSpeed 2>/dev/null", 
-             gpu_index * 2 + fan_index);
-    
-    fp = popen(command, "r");
-    if (fp != NULL) {
-        if (fgets(buffer, sizeof(buffer), fp) != NULL) {
-            char *value = strchr(buffer, ':');
-            if (value != NULL) {
-                value++; 
-                while (*value == ' ') value++; 
-                printf("當前風扇速度：%s", value);
-                printf("Current fan speed: %s", value);
-            }
-        }
-        pclose(fp);
+    if (result == 0) {
+        printf("已設置 GPU %d 的風扇 %d 速度為 %d%%\n", gpu_index, fan_index, speed);
+        printf("Set GPU %d fan %d speed to %d%%\n", gpu_index, fan_index, speed);
+    } else {
+        printf("設置 GPU %d 的風扇 %d 速度失敗\n", gpu_index, fan_index);
+        printf("Failed to set GPU %d fan %d speed\n", gpu_index, fan_index);
     }
 }
+
+
+void set_gpu_fan_speed(int gpu_index, int speed) {
+    static int total_fan_count = -1;
+
+    if (total_fan_count == -1) {
+        total_fan_count = get_gpu_fan_count();
+    }
+
+    if (device_count == 0 || total_fan_count == 0) {
+        printf("錯誤：未檢測到 GPU 或風扇\n");
+        printf("Error: No GPUs or fans detected\n");
+        return;
+    }
+
+    int fans_per_gpu = total_fan_count / device_count;
+    int start_fan_index = gpu_index * fans_per_gpu;
+
+    for (int i = 0; i < fans_per_gpu; i++) {
+        set_fan_speed(gpu_index, start_fan_index + i, speed);
+    }
+}
+void set_all_gpu_fan_speeds(int speed) {
+    for (unsigned int i = 0; i < device_count; i++) {
+        set_gpu_fan_speed(i, speed);
+    }
+}
+
 
 void enable_persistence_mode() {
     for (unsigned int i = 0; i < device_count; i++) {
@@ -364,7 +358,6 @@ void enable_persistence_mode() {
         snprintf(command, sizeof(command), "nvidia-smi -i %d -pm 1 > /dev/null 2>&1", i);
         system(command);
     }
-
 }
 
 int get_gpu_temp(nvmlDevice_t handle) {
@@ -376,26 +369,22 @@ int get_gpu_temp(nvmlDevice_t handle) {
 }
 
 int adjust_fan_speed(int temp) {
-    FanCurve *curve = read_fan_curve();
-    if (curve) {
-        for (int i = 0; i < curve->point_count - 1; i++) {
-            if (temp >= curve->points[i].temperature && temp < curve->points[i+1].temperature) {
-                int t1 = curve->points[i].temperature;
-                int t2 = curve->points[i+1].temperature;
-                int s1 = curve->points[i].fan_speed;
-                int s2 = curve->points[i+1].fan_speed;
-                free(curve);
-                return s1 + (s2 - s1) * (temp - t1) / (t2 - t1);
-            }
+    if (temp < 30) return 30;
+    if (temp >= 75) return 100;
+    
+
+    int temp_points[] = {30, 40, 50, 60, 70, 75};
+    int speed_points[] = {30, 40, 55, 70, 90, 100};
+    int num_points = sizeof(temp_points) / sizeof(temp_points[0]);
+    
+    for (int i = 0; i < num_points - 1; i++) {
+        if (temp >= temp_points[i] && temp < temp_points[i+1]) {
+            float slope = (float)(speed_points[i+1] - speed_points[i]) / (temp_points[i+1] - temp_points[i]);
+            return speed_points[i] + (int)(slope * (temp - temp_points[i]));
         }
-        free(curve);
     }
     
-    if (temp < 30) return 30;
-    if (temp > 65) return 100;    
-    float t = (temp - 30) / 30.0;
-    int fan_speed = 30 + (int)(70 * t * t);
-    return (fan_speed > 100) ? 100 : fan_speed;
+    return 100; 
 }
 
 void show_help(void) {
@@ -444,7 +433,7 @@ void list_gpus(void) {
         return;
     }
 
-    printf("檢測到的 GPU 列表：\n");
+    printf("檢測到的 GPU ：\n");
     printf("List of detected GPUs:\n");
     for (unsigned int i = 0; i < device_count; i++) {
         nvmlDevice_t device;
@@ -460,6 +449,7 @@ void list_gpus(void) {
         printf("GPU %u: %s\n", i, name);
     }
 }
+
 void write_config_for_gpu(const char* gpu_key, const char* mode, int speed) {
     json_t *root;
     json_error_t error;
@@ -481,48 +471,67 @@ void write_config_for_gpu(const char* gpu_key, const char* mode, int speed) {
 
     json_decref(root);
 }
-void maintain_fan_settings() {
-    while (keep_running) {
-        json_t *root;
-        json_error_t error;
 
-        root = json_load_file(CONFIG_FILE, 0, &error);
-        if (!root) {
-            root = json_object();
+void maintain_fan_settings() {
+    json_t *root;
+    json_error_t error;
+
+    root = json_load_file(CONFIG_FILE, 0, &error);
+    if (!root) {
+        syslog(LOG_ERR, "無法讀取配置文件: %s", error.text);
+        return;
+    }
+
+    for (unsigned int i = 0; i < device_count; i++) {
+        char gpu_key[20];
+        snprintf(gpu_key, sizeof(gpu_key), "gpu%d", i);
+        json_t *config_json = json_object_get(root, gpu_key);
+
+        nvmlDevice_t device;
+        if (nvmlDeviceGetHandleByIndex(i, &device) != NVML_SUCCESS) {
+            syslog(LOG_ERR, "無法獲取 GPU %d ", i);
+            continue;
         }
 
-        for (unsigned int i = 0; i < device_count; i++) {
-            char gpu_key[20];
-            snprintf(gpu_key, sizeof(gpu_key), "gpu%d", i);
-            json_t *config_json = json_object_get(root, gpu_key);
-            
-            nvmlDevice_t device;
-            nvmlDeviceGetHandleByIndex(i, &device);
-            int temp = get_gpu_temp(device);
-            int fan_count = get_gpu_fan_count(i);
-            int fan_speed;
+        int temp = get_gpu_temp(device);
+        int fan_speed;
 
-            if (json_is_object(config_json)) {
-                const char *mode = json_string_value(json_object_get(config_json, "mode"));
-                if (strcmp(mode, "manual") == 0) {
-                    fan_speed = json_integer_value(json_object_get(config_json, "speed"));
-                } else if (strcmp(mode, "curve") == 0) {
-                    fan_speed = adjust_fan_speed(temp);
+        if (json_is_object(config_json)) {
+            const char *mode = json_string_value(json_object_get(config_json, "mode"));
+            if (strcmp(mode, "manual") == 0) {
+                fan_speed = json_integer_value(json_object_get(config_json, "speed"));
+            } else if (strcmp(mode, "curve") == 0) {
+                FanCurve *curve = read_fan_curve();
+                if (curve) {
+                    fan_speed = adjust_fan_speed_with_curve(temp, curve);
+                    free(curve);
                 } else {
-                    fan_speed = adjust_fan_speed(temp);  
+                    fan_speed = adjust_fan_speed(temp);
                 }
             } else {
-                fan_speed = adjust_fan_speed(temp);  
+                fan_speed = adjust_fan_speed(temp);
             }
-
-            for (int j = 0; j < fan_count; j++) {
-                set_fan_speed(i, j, fan_speed);
-            }
+        } else {
+            fan_speed = adjust_fan_speed(temp);
         }
 
-        json_decref(root);
-        sleep(5);  
+        set_gpu_fan_speed(i, fan_speed);
     }
+
+    json_decref(root);
+}
+
+int adjust_fan_speed_with_curve(int temp, FanCurve *curve) {
+    for (int i = 0; i < curve->point_count - 1; i++) {
+        if (temp >= curve->points[i].temperature && temp < curve->points[i + 1].temperature) {
+            int temp_diff = curve->points[i + 1].temperature - curve->points[i].temperature;
+            int speed_diff = curve->points[i + 1].fan_speed - curve->points[i].fan_speed;
+            int temp_offset = temp - curve->points[i].temperature;
+            int fan_speed = curve->points[i].fan_speed + (temp_offset * speed_diff) / temp_diff;
+            return fan_speed;
+        }
+    }
+    return curve->points[curve->point_count - 1].fan_speed;
 }
 
 void signal_handler(int signum) {
@@ -531,7 +540,6 @@ void signal_handler(int signum) {
         keep_running = 0;
     }
 }
-
 
 void show_status(void) {
     json_t *root;
@@ -614,8 +622,17 @@ int main(int argc, char *argv[]) {
     printf("==================================================\n");
 
     enable_persistence_mode();
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
 
-    if (argc == 1 || strcmp(argv[1], "-h") == 0) {
+    if (argc == 1) {
+        printf("進入持續運行模式...\n");
+        printf("Entering continuous running mode...\n");
+        while (keep_running) {
+            maintain_fan_settings();
+            sleep(5);  
+        }
+    } else if (strcmp(argv[1], "-h") == 0) {
         show_help();
     } else if (strcmp(argv[1], "status") == 0) {
         show_status();
@@ -624,19 +641,37 @@ int main(int argc, char *argv[]) {
             char gpu_key[20];
             snprintf(gpu_key, sizeof(gpu_key), "gpu%d", i);
             write_config_for_gpu(gpu_key, "auto", 0);
+            
             char command[256];
             snprintf(command, sizeof(command), 
-                     "nvidia-settings -c :0 -a [gpu:%d]/GPUFanControlState=0 2>/dev/null", i);
+                     "nvidia-settings -c :0 -a [gpu:%d]/GPUFanControlState=1 2>/dev/null", i);
             system(command);
+            
+            nvmlDevice_t device;
+            nvmlDeviceGetHandleByIndex(i, &device);
+            int temp = get_gpu_temp(device);
+            int fan_speed = adjust_fan_speed(temp);
+            set_gpu_fan_speed(i, fan_speed);
         }
         printf("所有 GPU 風扇控制設置為自動模式。\n");
         printf("All GPU fan control set to automatic mode.\n");
-    } else if (strncmp(argv[1], "curve", 4) == 0) {
+    } else if (strcmp(argv[1], "curve") == 0) {
         if (argc == 2) {
             for (unsigned int i = 0; i < device_count; i++) {
                 char gpu_key[20];
                 snprintf(gpu_key, sizeof(gpu_key), "gpu%d", i);
                 write_config_for_gpu(gpu_key, "curve", 0);
+                
+                char command[256];
+                snprintf(command, sizeof(command), 
+                         "nvidia-settings -c :0 -a [gpu:%d]/GPUFanControlState=1 2>/dev/null", i);
+                system(command);
+                
+                nvmlDevice_t device;
+                nvmlDeviceGetHandleByIndex(i, &device);
+                int temp = get_gpu_temp(device);
+                int fan_speed = adjust_fan_speed(temp);
+                set_gpu_fan_speed(i, fan_speed);
             }
             printf("所有 GPU 風扇控制設置為曲線模式。\n");
             printf("All GPU fan control set to curve mode.\n");
@@ -672,7 +707,7 @@ int main(int argc, char *argv[]) {
         
         if (argc == 2) {
             speed = atoi(argv[1]);
-            gpu_index = -1;  // 表示所有 GPU
+            gpu_index = -1;  
         } else if (argc == 3) {
             gpu_index = atoi(argv[1]);
             speed = atoi(argv[2]);
@@ -684,19 +719,13 @@ int main(int argc, char *argv[]) {
                     char gpu_key[20];
                     snprintf(gpu_key, sizeof(gpu_key), "gpu%d", i);
                     write_config_for_gpu(gpu_key, "manual", speed);
-                    int fan_count = get_gpu_fan_count(i);
-                    for (int j = 0; j < fan_count; j++) {
-                        set_fan_speed(i, j, speed);
-                    }
+                    set_gpu_fan_speed(i, speed);
                 }
             } else if (gpu_index >= 0 && gpu_index < (int)device_count) {
                 char gpu_key[20];
                 snprintf(gpu_key, sizeof(gpu_key), "gpu%d", gpu_index);
                 write_config_for_gpu(gpu_key, "manual", speed);
-                int fan_count = get_gpu_fan_count(gpu_index);
-                for (int j = 0; j < fan_count; j++) {
-                    set_fan_speed(gpu_index, j, speed);
-                }
+                set_gpu_fan_speed(gpu_index, speed);
             } else {
                 printf("無效的 GPU 索引。請使用 'igfc list' 查看可用的 GPU。\n");
                 printf("Invalid GPU index. Use 'igfc list' to see available GPUs.\n");
@@ -718,14 +747,11 @@ int main(int argc, char *argv[]) {
 }
 EOL
 
-
 echo "Compiling C program..."
 gcc -o /usr/local/bin/infinirc_gpu_fan_control /usr/local/src/infinirc_gpu_fan_control.c -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lnvidia-ml -ljansson
 
-
 echo "Creating command alias..."
 echo "alias igfc='sudo /usr/local/bin/infinirc_gpu_fan_control'" >> /etc/bash.bashrc
-
 
 echo "Creating systemd service file..."
 cat > /etc/systemd/system/infinirc-gpu-fan-control.service << EOL
@@ -737,9 +763,10 @@ After=multi-user.target
 Type=simple
 ExecStart=/usr/local/bin/infinirc_gpu_fan_control
 Restart=always
+RestartSec=5
 
 [Install]
-WantedBy=multi-user.target  
+WantedBy=multi-user.target
 EOL
 
 echo "創建默認風扇曲線..."
@@ -761,7 +788,6 @@ cat > /etc/infinirc_gpu_fan_curve.json.README << EOL
 # {
 #     "溫度": 風扇速度,
 #     "temperature": fan_speed,
-#     ...
 # }
 #
 # 溫度單位為攝氏度，風扇速度為百分比
@@ -840,4 +866,4 @@ EOL
 echo "重新啟動服務..."
 echo "Restarting the service..."
 systemctl restart infinirc-gpu-fan-control.service
-systemctl enable infinirc-gpu-fan-control.service  
+systemctl enable infinirc-gpu-fan-control.service
